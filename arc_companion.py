@@ -1964,7 +1964,7 @@ def init_ocr():
         OCR_API = PyTessBaseAPI(
             path=TESSDATA_PATH,
             lang="eng",
-            psm=PSM.AUTO,
+            psm=PSM.SINGLE_BLOCK,
         )
         OCR_API.SetVariable(
             "tessedit_char_whitelist",
@@ -2149,6 +2149,7 @@ def ocr_item_lines(name_roi_bgr) -> list[str]:
 
     lines: list[str] = []
     for raw_line in text.splitlines():
+
         # collapse internal whitespace and strip
         line = " ".join(raw_line.split())
         if not line:
@@ -2306,6 +2307,10 @@ TOOLTIP_IMAGE_CACHE = {}
 LAST_SHOWN_ROW = None
 LAST_SHOWN_PANEL_BOX = None
 
+# offsets of the game monitor in the virtual desktop
+MONITOR_LEFT = 0
+MONITOR_TOP = 0
+
 
 def init_overlay_window():
     global TOOLTIP_ROOT, TOOLTIP_LABEL, SCREEN_W, SCREEN_H, TOOLTIP_VISIBLE
@@ -2329,6 +2334,7 @@ def init_overlay_window():
     TOOLTIP_LABEL = tk.Label(TOOLTIP_ROOT, bd=0, bg=TRANSP_COLOR)
     TOOLTIP_LABEL.pack()
 
+    # default: use actual screen size; will be overridden with game monitor
     SCREEN_W = TOOLTIP_ROOT.winfo_screenwidth()
     SCREEN_H = TOOLTIP_ROOT.winfo_screenheight()
 
@@ -3117,7 +3123,7 @@ def create_helper_tooltip_image(
 def get_helper_gaps():
     """
     Return (gap_x, gap_y) scaled from the 1920x1080 reference
-    to the current screen size.
+    to the current screen size (game monitor).
     """
     w = SCREEN_W or REF_W
     h = SCREEN_H or REF_H
@@ -3146,9 +3152,12 @@ def show_helper_tooltip(
 ):
     """
     Show the helper tooltip next to the detected panel.
+
+    NOTE: panel box and tooltip math is done in *monitor-local* coordinates,
+    then converted to global desktop coordinates once for the Tk window.
     """
     global TOOLTIP_PHOTO, TOOLTIP_VISIBLE, TOOLTIP_CACHE_KEY, TOOLTIP_IMAGE_CACHE
-    global HELPER_SCREEN_RECT
+    global HELPER_SCREEN_RECT, MONITOR_LEFT, MONITOR_TOP
 
     if global_panel_box is None:
         hide_helper_tooltip()
@@ -3222,6 +3231,11 @@ def show_helper_tooltip(
     right_fits = x_right + w <= SCREEN_W - margin
 
     mx, my = get_mouse_position()
+    # convert mouse position from global desktop to monitor-local coordinates
+    if mx is not None and my is not None:
+        mx -= MONITOR_LEFT
+        my -= MONITOR_TOP
+
     panel_center_x = gx1 + (gx2 - gx1) // 2
 
     def horizontal_distance(mx_, tx_, tw_):
@@ -3297,8 +3311,13 @@ def show_helper_tooltip(
                     x, y = pos
 
     if TOOLTIP_ROOT is not None:
-        TOOLTIP_ROOT.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
+        # convert monitor-local tooltip coords to global desktop coords for Tk
+        global_x = int(x + MONITOR_LEFT)
+        global_y = int(y + MONITOR_TOP)
 
+        TOOLTIP_ROOT.geometry(f"{w}x{h}+{global_x}+{global_y}")
+
+        # HELPER_SCREEN_RECT is stored in monitor-local coordinates
         HELPER_SCREEN_RECT = (int(x), int(y), int(x) + w, int(y) + h)
 
         if not TOOLTIP_VISIBLE:
@@ -3480,11 +3499,115 @@ def start_hotkey_listeners():
     HOTKEY_LISTENERS_STARTED = True
 
 
+def get_arc_raiders_monitor(sct, game_title: str = "ARC Raiders"):
+    """
+    Try to find the monitor that contains the ARC Raiders window.
+
+    - On Windows: enumerate top-level windows, find one whose title contains
+      `game_title`, get its rect and select the monitor whose bounds contain
+      the window center.
+    - On other platforms or if not found: fall back to sct.monitors[1]
+      (current behavior).
+    """
+    # Non-Windows: just use primary monitor as before
+    if os.name != "nt":
+        return sct.monitors[1]
+
+    user32 = ctypes.windll.user32
+
+    EnumWindows = user32.EnumWindows
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p
+    )
+    GetWindowTextLengthW = user32.GetWindowTextLengthW
+    GetWindowTextW = user32.GetWindowTextW
+    IsWindowVisible = user32.IsWindowVisible
+    GetWindowRect = user32.GetWindowRect
+
+    target_hwnd = ctypes.c_void_p()
+
+    game_title_lower = game_title.lower()
+
+    def callback(hwnd, lParam):
+        nonlocal target_hwnd
+
+        # Only visible windows
+        if not IsWindowVisible(hwnd):
+            return True
+
+        length = GetWindowTextLengthW(hwnd)
+        if length == 0:
+            return True
+
+        buf = ctypes.create_unicode_buffer(length + 1)
+        GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value.strip()
+
+        if not title:
+            return True
+
+        if game_title_lower in title.lower():
+            target_hwnd = ctypes.c_void_p(hwnd)
+            # Stop enumeration
+            return False
+
+        return True
+
+    try:
+        EnumWindows(EnumWindowsProc(callback), 0)
+    except Exception:
+        # In case EnumWindows fails, just fall back
+        target_hwnd = ctypes.c_void_p()
+
+    # If we didn't find a matching window, use primary
+    if not target_hwnd.value:
+        return sct.monitors[1]
+
+    # Get window rect
+    rect = (ctypes.c_long * 4)()
+    if not GetWindowRect(target_hwnd, rect):
+        # If GetWindowRect fails, fall back
+        return sct.monitors[1]
+
+    left, top, right, bottom = rect
+    win_cx = (left + right) // 2
+    win_cy = (top + bottom) // 2
+
+    # mss.monitors[0] is the virtual screen; real monitors start at index 1
+    chosen_monitor = None
+    for m in sct.monitors[1:]:
+        m_left = m.get("left", 0)
+        m_top = m.get("top", 0)
+        m_width = m.get("width", 0)
+        m_height = m.get("height", 0)
+
+        m_right = m_left + m_width
+        m_bottom = m_top + m_height
+
+        if m_left <= win_cx < m_right and m_top <= win_cy < m_bottom:
+            chosen_monitor = m
+            break
+
+    if chosen_monitor is not None:
+        return chosen_monitor
+
+    # If the window center didn't fall inside any monitor (weird edge case),
+    # keep old behavior
+    return sct.monitors[1]
+
+
 def main_live():
-    global LAST_OCR_TIME, LAST_SHOWN_ROW, LAST_SHOWN_PANEL_BOX, SETTINGS, TOOLTIP_NEEDS_REFRESH, TOOLTIP_IMAGE_CACHE
+    global LAST_OCR_TIME, LAST_SHOWN_ROW,LAST_SHOWN_PANEL_BOX,SETTINGS,TOOLTIP_NEEDS_REFRESH,TOOLTIP_IMAGE_CACHE,SCREEN_W,SCREEN_H,MONITOR_LEFT,MONITOR_TOP
 
     sct = mss()
-    monitor = sct.monitors[1]
+    # Prefer the monitor ARC Raiders is on; fall back to primary
+    monitor = get_arc_raiders_monitor(sct)
+
+    # Use game monitor dimensions and offsets for all tooltip math
+    MONITOR_LEFT = monitor.get("left", 0)
+    MONITOR_TOP = monitor.get("top", 0)
+    SCREEN_W = monitor.get("width", SCREEN_W)
+    SCREEN_H = monitor.get("height", SCREEN_H)
 
     last_settings_mtime = None
     try:
@@ -3527,6 +3650,7 @@ def main_live():
 
             if gating_active:
                 sct_img = sct.grab(monitor)
+                # frame_full is in monitor-local coordinates (0..width, 0..height)
                 frame_full = np.array(sct_img)[:, :, :3]
 
                 panel_box = find_tooltip_panel_by_color(frame_full)
@@ -3538,6 +3662,7 @@ def main_live():
                     name_roi_primary = crop_name_region_from_panel(
                         frame_full, panel_box
                     )
+
                     name_roi_secondary = crop_name_region_from_panel_alt(
                         frame_full, panel_box
                     )
@@ -3642,6 +3767,7 @@ def main_live():
                         or TOOLTIP_NEEDS_REFRESH
                 ):
                     x1, y1, x2, y2 = last_panel_box
+                    # panel_box is already monitor-local; keep it that way
                     global_panel_box = (x1, y1, x2, y2, 1.0)
                     show_helper_tooltip(
                         last_row,
